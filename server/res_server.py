@@ -4,6 +4,8 @@ import socket
 import threading
 import itertools
 import time
+import json
+import urllib.request
 
 HOST = '0.0.0.0'
 PORT = 9000
@@ -18,14 +20,38 @@ def log(msg):
     print("[%s] %s" % (time.strftime('%H:%M:%S'), msg), flush=True)
 
 
-def controller_reserve(src, dst, bw, dur, prio):
-    """STUB: Block 3 replaces this with a REST call to Ryu."""
-    return True, "stub"
+CTRL = 'http://192.168.100.1:8080'
+ctrl_ids = {}          # server res_id -> controller res_id
 
 
-def controller_release(res_id):
-    """STUB: Block 3 replaces this with a REST call to Ryu."""
-    return True
+def _call(method, path, body=None):
+    req = urllib.request.Request(
+        CTRL + path, method=method,
+        data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
+def controller_reserve(src, dst, bw, dur, prio, user='?'):
+    """Ask Ryu to admit the reservation. Returns (ok, info, ctrl_id)."""
+    try:
+        r = _call('POST', '/reserve', {'src': src, 'dst': dst, 'bw': bw,
+                                       'duration': dur, 'priority': prio,
+                                       'user': user})
+    except Exception as e:
+        log("controller unreachable: %s" % e)
+        return False, 'controller_unavailable', None
+    if r.get('ok'):
+        return True, r.get('path', ''), r['res_id']
+    return False, r.get('reason', 'rejected'), None
+
+
+def controller_release(ctrl_id):
+    try:
+        return _call('DELETE', '/reserve/%d' % ctrl_id).get('ok', False)
+    except Exception as e:
+        log("controller unreachable: %s" % e)
+        return False
 
 
 def handle_command(line, state):
@@ -59,10 +85,12 @@ def handle_command(line, state):
         if bw <= 0 or bw > 10 or dur <= 0 or not (0 <= prio <= 7):
             return "ERR out_of_range"
         with lock:
-            ok, info = controller_reserve(src, dst, bw, dur, prio)
+            ok, info, cid = controller_reserve(src, dst, bw, dur, prio,
+                                               state['user'])
             if not ok:
                 return "REJECT %s" % info
-            res_id = next(id_counter)
+            res_id = cid
+            ctrl_ids[res_id] = cid
             reservations[res_id] = {'user': state['user'], 'src': src,
                                     'dst': dst, 'bw': bw, 'dur': dur,
                                     'prio': prio}
@@ -80,7 +108,7 @@ def handle_command(line, state):
                 return "ERR no_such_reservation"
             if r['user'] != state['user'] and state['user'] != 'admin':
                 return "REJECT not_owner"
-            controller_release(rid)
+            controller_release(ctrl_ids.get(rid, rid))
             del reservations[rid]
         log("RELEASE #%d by %s" % (rid, state['user']))
         return "OK released"
