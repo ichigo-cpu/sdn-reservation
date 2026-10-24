@@ -52,6 +52,7 @@ class ReservationCtrl(app_manager.RyuApp):
         self.next_id = 1
         self.lock = threading.Lock()
         self.down_links = set()             # set of frozenset({a, b})
+        self.port_down = set()              # (dpid, port) currently down
         self.default_path = 'primary'       # which path default flows use
         self.last_stats = {}                # (dpid, port) -> (time, tx_bytes)
 
@@ -236,8 +237,17 @@ class ReservationCtrl(app_manager.RyuApp):
         link = self._link_of(dp.id, msg.desc.port_no)
         if link is None:
             return                          # host-facing port, ignore
-        is_down = bool(msg.desc.state & ofp.OFPPS_LINK_DOWN) or \
+        port_is_down = bool(msg.desc.state & ofp.OFPPS_LINK_DOWN) or \
             bool(msg.desc.config & ofp.OFPPC_PORT_DOWN)
+        key = (dp.id, msg.desc.port_no)
+        if port_is_down:
+            self.port_down.add(key)
+        else:
+            self.port_down.discard(key)
+        # a link is down if EITHER of its two ports is down
+        la, lb = sorted(link)
+        ends = [(la, PORTS[(la, lb)]), (lb, PORTS[(lb, la)])]
+        is_down = any(e in self.port_down for e in ends)
         with self.lock:
             if is_down == (link in self.down_links):
                 return                      # nothing changed
