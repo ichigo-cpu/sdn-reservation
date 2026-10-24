@@ -36,6 +36,9 @@ PATHS = [('primary', [1, 2, 4]), ('backup', [1, 3, 4])]
 LINK_CAP = 10.0          # Mbps per inter-switch link
 RES_PRIORITY = 100       # flow priority for reserved traffic (default flows = 10)
 POLL_S = 2               # port-stats polling interval (seconds)
+BE_METER_ID = 1000      # meter id used for best-effort traffic
+BE_MIN_KBPS = 200       # best-effort never throttled below this
+BE_HEADROOM = 0.9       # use only 90% of the spare capacity
 RESULTS_DIR = os.path.abspath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'results'))
 
@@ -52,6 +55,8 @@ class ReservationCtrl(app_manager.RyuApp):
         self.next_id = 1
         self.lock = threading.Lock()
         self.down_links = set()             # set of frozenset({a, b})
+        self.be_ready = set()   # dpids whose best-effort meter exists
+        self.policing = True    # throttle best-effort traffic?
         self.port_down = set()              # (dpid, port) currently down
         self.default_path = 'primary'       # which path default flows use
         self.last_stats = {}                # (dpid, port) -> (time, tx_bytes)
@@ -88,10 +93,16 @@ class ReservationCtrl(app_manager.RyuApp):
     def _push_defaults(self, dp):
         ofp, parser = dp.ofproto, dp.ofproto_parser
         routes = self._routes_for(dp.id)
+        police = self.policing and dp.id == 1
+        if police:
+            self._set_be_meter(dp)
         for ip, port in routes.items():
             match = parser.OFPMatch(eth_type=0x0800, ipv4_dst=ip)
-            inst = [parser.OFPInstructionActions(
-                ofp.OFPIT_APPLY_ACTIONS, [parser.OFPActionOutput(port)])]
+            inst = []
+            if police and ip in ('10.0.0.3', '10.0.0.4'):
+                inst.append(parser.OFPInstructionMeter(BE_METER_ID))
+            inst.append(parser.OFPInstructionActions(
+                ofp.OFPIT_APPLY_ACTIONS, [parser.OFPActionOutput(port)]))
             dp.send_msg(parser.OFPFlowMod(
                 datapath=dp, priority=10, match=match, instructions=inst))
         return len(routes)
@@ -100,6 +111,7 @@ class ReservationCtrl(app_manager.RyuApp):
     def on_switch(self, ev):
         dp = ev.msg.datapath
         self.dps[dp.id] = dp
+        self.be_ready.discard(dp.id)
         n = self._push_defaults(dp)
         self.logger.info("Installed %d default flows on s%d", n, dp.id)
 
@@ -159,6 +171,7 @@ class ReservationCtrl(app_manager.RyuApp):
                              'expires': time.time() + dur}
             self._event('ADMIT', "#%d %s->%s %.1fMbps via %s %s"
                         % (rid, src, dst, bw, name, path))
+            self._update_be()
             return True, name, rid
 
     def release(self, rid):
@@ -187,6 +200,7 @@ class ReservationCtrl(app_manager.RyuApp):
         for l in self._links(r['hops']):
             self.reserved[l] = max(0.0, self.reserved[l] - r['bw'])
         self._event('REMOVED', '#%d' % rid)
+        self._update_be()
         return True
 
     def _install(self, rid, path, src, dst, bw):
@@ -209,6 +223,34 @@ class ReservationCtrl(app_manager.RyuApp):
             dp.send_msg(p.OFPFlowMod(
                 datapath=dp, cookie=rid, priority=RES_PRIORITY,
                 match=match, instructions=inst))
+
+    # ---------- BLOCK 5: best-effort policing ----------
+    def _set_be_meter(self, dp):
+        ofp, p = dp.ofproto, dp.ofproto_parser
+        path = PATHS[1][1] if self.default_path == 'backup' else PATHS[0][1]
+        spare = min(LINK_CAP - self.reserved[l] for l in self._links(path))
+        kbps = max(BE_MIN_KBPS, int(spare * 1000 * BE_HEADROOM))
+        band = p.OFPMeterBandDrop(rate=kbps, burst_size=max(kbps // 10, 50))
+        cmd = ofp.OFPMC_MODIFY if dp.id in self.be_ready else ofp.OFPMC_ADD
+        dp.send_msg(p.OFPMeterMod(datapath=dp, command=cmd,
+                                  flags=ofp.OFPMF_KBPS,
+                                  meter_id=BE_METER_ID, bands=[band]))
+        self.be_ready.add(dp.id)
+        self.logger.info("BE meter on s%d = %d kbps", dp.id, kbps)
+
+    def _update_be(self):                  # caller holds the lock
+        if not self.policing:
+            return
+        dp = self.dps.get(1)
+        if dp is not None:
+            self._set_be_meter(dp)
+
+    def set_policing(self, on):
+        with self.lock:
+            self.policing = on
+            for dp in self.dps.values():
+                self._push_defaults(dp)
+            self._event('POLICING', 'on' if on else 'off')
 
     # ---------- auto-expiry ----------
     def _expiry_loop(self):
@@ -257,6 +299,7 @@ class ReservationCtrl(app_manager.RyuApp):
                 self._event('LINK_DOWN', 's%d-s%d' % (a, b))
                 self._refresh_defaults()
                 self._reroute_affected()
+                self._update_be()
                 self._event('FAILOVER_DONE', '%.1f ms'
                             % ((time.time() - t0) * 1000))
             else:
@@ -375,4 +418,14 @@ class ResAPI(ControllerBase):
     def get_status(self, req, **kw):
         down = ["s%d-s%d" % tuple(sorted(l)) for l in self.app.down_links]
         return _json({'down_links': down,
-                      'default_path': self.app.default_path})
+                      'default_path': self.app.default_path,
+                      'policing': self.app.policing})
+
+    @route('res', '/policing', methods=['POST'])
+    def set_policing(self, req, **kw):
+        try:
+            on = bool(json.loads(req.body.decode('utf-8'))['enabled'])
+        except Exception:
+            return _json({'ok': False, 'reason': 'bad_request'}, 400)
+        self.app.set_policing(on)
+        return _json({'ok': True, 'policing': on})
