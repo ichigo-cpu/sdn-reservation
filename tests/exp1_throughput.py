@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Experiment 1: throughput of h1->h3 under 5 conditions (3 runs x 10 s each).
+"""Experiment 1: throughput of h1->h3 under 5 conditions (5 runs x 20 s each).
 Run with Ryu already running (Terminal A) and NO other Mininet running:
     sudo python3 tests/exp1_throughput.py
 """

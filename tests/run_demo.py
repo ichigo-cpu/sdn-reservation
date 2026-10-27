@@ -56,7 +56,7 @@ def main():
         api('POST', '/policing', {'enabled': False})
 
         banner('STAGE 1: connectivity (pingall)')
-        net.pingAll()
+        print('Packet loss: %s%%' % net.pingAll())
 
         banner('STAGE 2: reserve 4 Mbps h1 -> h3 over TCP')
         print('Without reservation: %.2f Mbps' % iperf(h1, 8))
@@ -75,10 +75,14 @@ def main():
         for pol in (False, True):
             api('POST', '/policing', {'enabled': pol})
             time.sleep(2)
-            h2.cmd('(sleep 2; iperf -c 10.0.0.3 -p 5002 -P 4 -t 14) > /dev/null 2>&1 &')
-            print('policing %-3s: %.2f Mbps' % ('ON' if pol else 'OFF', iperf(h1, 12)))
-            h2.cmd('pkill -f "iperf -c"')
-            time.sleep(3)
+            vals = []
+            for trial in range(3):
+                h2.cmd('(sleep 2; iperf -c 10.0.0.3 -p 5002 -P 4 -t 14) > /dev/null 2>&1 &')
+                vals.append(iperf(h1, 12))
+                h2.cmd('pkill -f "iperf -c"')
+                time.sleep(3)
+            print('policing %-3s: runs %s  mean %.2f Mbps' % ('ON' if pol else 'OFF',
+                  ' / '.join('%.2f' % v for v in vals), sum(vals) / len(vals)))
         release_all()
         time.sleep(1)
 

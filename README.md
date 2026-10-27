@@ -162,3 +162,35 @@ The reservation moved to the backup path [1,3,4] (REROUTED) in 0.3-0.4 ms. Witho
 | `results/` | CSV results, plots, controller logs |
 | `results/block5/` | saved Block 5 evidence |
 | `scripts/setup_mgmt.sh` | old manual veth helper (obsolete) |
+
+## 10. Demo (one command)
+
+Reproduce the whole demo from a clean start.
+
+**Terminal A** (controller):
+
+~~~
+cd /home/vboxuser/sdn-reservation
+sudo mn -c
+source ~/ryu-env/bin/activate
+ryu-manager controller/reservation_ctrl.py
+~~~
+
+**Terminal C** (no other Mininet open; takes about 4 minutes):
+
+~~~
+cd /home/vboxuser/sdn-reservation
+sudo python3 tests/run_demo.py
+~~~
+
+The `sch_htb ... quantum is big` warnings are harmless. The script runs five stages:
+
+| Stage | What it shows | Result in our rehearsal |
+|---|---|---|
+| 1 | pingall | 0.0% packet loss |
+| 2 | 4 Mbps reservation over TCP | 9.52 Mbps without, 4.20 Mbps with |
+| 3 | admission control | 4+4 Mbps admitted on primary, 3rd on backup, 7 Mbps rejected |
+| 4 | congestion, 3 runs each | policing OFF mean 1.87 Mbps (2.23 / 1.65 / 1.74), policing ON mean 3.93 Mbps (4.04 / 3.70 / 4.05) |
+| 5 | link s1-s2 down at +4 s, up at +8 s | no zero-throughput seconds; REROUTED 0.3 ms, FAILOVER_DONE 2.0 ms |
+
+Individual runs vary (see Experiment 1), so exact numbers differ between executions.
